@@ -1,0 +1,9 @@
+name = "chatbot-worker"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# 環境變數在 Cloudflare Dashboard 設定，不要寫在這裡
+# GEMINI_API_KEY
+# NOTION_TOKEN
+# NOTION_DB_ID
+# ALLOWED_ORIGIN
