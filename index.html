@@ -717,8 +717,10 @@
         setStatus('說完了嗎？繼續按住麥克風', '');
 
       } catch (err) {
-        setStatus('連線失敗：' + err.message, '');
-        console.error(err);
+  setStatus('連線失敗：' + err.message, '');
+  alert('錯誤詳情：' + err.message + '\nWorker URL: ' + WORKER_URL);
+  console.error(err);
+}
       } finally {
         btnMic.classList.remove('disabled');
       }
