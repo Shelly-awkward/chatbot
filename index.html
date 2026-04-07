@@ -666,14 +666,14 @@
 }
 
     // ─── 送出至 Worker ──────────────────────────────────────
-    async function sendToWorker(audioBlob) {
+    async function sendToWorker(audioBlob, mimeType = 'audio/mp4') {
       setStatus('AI 思考中…', 'processing');
       btnMic.classList.add('disabled');
 
       try {
         const systemPrompt = getSystemPrompt();
         const formData = new FormData();
-        formData.append('audio', audioBlob, 'recording.webm');
+        const ext = mimeType.includes('mp4') ? 'm4a' : 'webm'; formData.append('audio', audioBlob, `recording.${ext}`); formData.append('mimeType', mimeType);;
         formData.append('systemPrompt', systemPrompt);
         formData.append('history', JSON.stringify(conversationHistory));
         formData.append('lang', currentLang);
