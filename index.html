@@ -658,7 +658,7 @@
       mediaRecorder.stream.getTracks().forEach(t => t.stop());
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'; const audioBlob = new Blob(audioChunks, { type: mimeType });
         if (audioBlob.size < 1000) { setStatus('太短了，請再說一次'); return; }
         await sendToWorker(audioBlob);
       };
