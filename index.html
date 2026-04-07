@@ -649,20 +649,21 @@
     }
 
     async function stopRecording() {
-      if (!isRecording || !mediaRecorder) return;
-      isRecording = false;
-      btnMic.classList.remove('recording');
-      btnMic.textContent = '🎙️';
+  if (!isRecording || !mediaRecorder) return;
+  isRecording = false;
+  btnMic.classList.remove('recording');
+  btnMic.textContent = '🎙️';
 
-      mediaRecorder.stop();
-      mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  mediaRecorder.stop();
+  mediaRecorder.stream.getTracks().forEach(t => t.stop());
 
-      mediaRecorder.onstop = async () => {
-        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'; const audioBlob = new Blob(audioChunks, { type: mimeType });
-        if (audioBlob.size < 1000) { setStatus('太短了，請再說一次'); return; }
-        await sendToWorker(audioBlob);
-      };
-    }
+  mediaRecorder.onstop = async () => {
+    const mimeType = audioChunks[0]?.type || 'audio/mp4';
+    const audioBlob = new Blob(audioChunks, { type: mimeType });
+    if (audioBlob.size < 1000) { setStatus('太短了，請再說一次'); return; }
+    await sendToWorker(audioBlob, mimeType);
+  };
+}
 
     // ─── 送出至 Worker ──────────────────────────────────────
     async function sendToWorker(audioBlob) {
