@@ -719,7 +719,11 @@
 
       } catch (err) {
   setStatus('連線失敗：' + err.message, '');
-  alert('錯誤詳情：' + err.message + '\nWorker URL: ' + WORKER_URL);
+  alert(JSON.stringify({
+    message: err.message,
+    name: err.name,
+    workerUrl: WORKER_URL
+  }));
   console.error(err);
 }
       } finally {
