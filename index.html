@@ -554,9 +554,10 @@
     let playbackCtx = null;    // 播放用
     let micStream = null;
     let scriptProcessor = null;
-    let nextPlayTime = 0;
+    let pendingAudioChunks = [];  // 收集本輪 AI 音訊 chunks，turnComplete 時一次播放
     let currentAiText = '';
     let currentAiMsgEl = null;
+    window._userMsgEl = null;     // 使用者語音轉錄的 bubble（逐步更新用）
 
     // ─── DOM ────────────────────────────────────────────────
     const btnMic = document.getElementById('btnMic');
@@ -695,48 +696,65 @@
 
       // Gemini 打斷（使用者說話時打斷 AI）
       if (msg.serverContent?.interrupted) {
-        nextPlayTime = 0;
+        pendingAudioChunks = [];
         return;
       }
 
-      // 使用者語音轉錄（需在 setup 啟用 inputAudioTranscription）
-      if (msg.serverContent?.inputTranscription?.finished && msg.serverContent.inputTranscription.text) {
-        const userText = msg.serverContent.inputTranscription.text.trim();
-        if (userText) {
-          addMessage('user', userText);
-          conversationHistory.push({ role: 'user', content: userText });
+      // 使用者語音轉錄
+      if (msg.serverContent?.inputTranscription) {
+        const trans = msg.serverContent.inputTranscription;
+        if (trans.text?.trim()) {
+          // 逐步更新或建立使用者 bubble（最後 finished 時固定）
+          if (!window._userMsgEl) {
+            emptyState.classList.add('hidden');
+            window._userMsgEl = document.createElement('div');
+            window._userMsgEl.className = 'msg user';
+            conversation.appendChild(window._userMsgEl);
+          }
+          window._userMsgEl.textContent = trans.text.trim();
+          conversation.scrollTop = conversation.scrollHeight;
+          if (trans.finished) {
+            conversationHistory.push({ role: 'user', content: trans.text.trim() });
+            window._userMsgEl = null;
+          }
         }
       }
 
-      // AI 回應（音訊 + 文字串流）
+      // AI 音訊 chunks（收集起來，等 turnComplete 一次播放）
       if (msg.serverContent?.modelTurn?.parts) {
         for (const part of msg.serverContent.modelTurn.parts) {
-          // 音訊串流
           if (part.inlineData?.mimeType?.startsWith('audio/') && outputMode !== 'text') {
             const rateMatch = part.inlineData.mimeType.match(/rate=(\d+)/);
             const sampleRate = rateMatch ? parseInt(rateMatch[1]) : 24000;
-            playPCM16(part.inlineData.data, sampleRate);
+            pendingAudioChunks.push({ data: part.inlineData.data, sampleRate });
           }
-          // 文字串流（逐字累積）
-          if (part.text) {
-            currentAiText += part.text;
-            if (outputMode !== 'audio') {
-              if (!currentAiMsgEl) {
-                emptyState.classList.add('hidden');
-                currentAiMsgEl = document.createElement('div');
-                currentAiMsgEl.className = 'msg ai';
-                conversation.appendChild(currentAiMsgEl);
-              }
-              currentAiMsgEl.textContent = currentAiText;
-              conversation.scrollTop = conversation.scrollHeight;
-            }
+        }
+      }
+
+      // AI 文字字幕（outputTranscription，純 AUDIO 模式下使用）
+      if (msg.serverContent?.outputTranscription) {
+        const trans = msg.serverContent.outputTranscription;
+        if (trans.text && outputMode !== 'audio') {
+          currentAiText += trans.text;
+          if (!currentAiMsgEl) {
+            emptyState.classList.add('hidden');
+            currentAiMsgEl = document.createElement('div');
+            currentAiMsgEl.className = 'msg ai';
+            conversation.appendChild(currentAiMsgEl);
           }
+          currentAiMsgEl.textContent = currentAiText;
+          conversation.scrollTop = conversation.scrollHeight;
         }
       }
 
       // AI 回應結束（本輪完成）
       if (msg.serverContent?.turnComplete) {
-        // 解析糾錯標注
+        // 一次播放本輪全部音訊
+        if (pendingAudioChunks.length > 0 && outputMode !== 'text') {
+          playPCMChunks(pendingAudioChunks);
+          pendingAudioChunks = [];
+        }
+        // 解析並固定 AI 文字 bubble
         if (currentAiMsgEl && currentAiText) {
           const correctionMatch = currentAiText.match(/\[糾錯\]\s*([\s\S]*)/);
           if (correctionMatch) {
@@ -756,7 +774,6 @@
           conversationHistory.push({ role: 'assistant', content: currentAiText });
           currentAiText = '';
         }
-        setStatus('說完了嗎？繼續按住麥克風', '');
         sessionActive = true;
         btnEnd.classList.remove('hidden');
         if (conversationHistory.length >= 4) btnCards.style.display = 'flex';
@@ -800,10 +817,11 @@
         }
       }
 
-      // 打斷 AI 正在說話時，重置播放佇列
-      nextPlayTime = 0;
+      // 打斷 AI 正在說話時，清空暫存
+      pendingAudioChunks = [];
       currentAiText = '';
       currentAiMsgEl = null;
+      window._userMsgEl = null;
 
       micStream = stream;
       isStreaming = true;
@@ -852,29 +870,48 @@
       }
     }
 
-    // ─── PCM 播放（Gemini 回傳 PCM 24kHz）──────────────────
-    function playPCM16(base64, sampleRate = 24000) {
-      if (!playbackCtx) return;
-      setStatus('AI 說話中…', 'speaking');
+    // ─── PCM 播放（收集整輪 chunks，turnComplete 時一次播放）──
+    function playPCMChunks(chunks) {
+      if (!playbackCtx || chunks.length === 0) return;
 
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const sampleRate = chunks[0].sampleRate || 24000;
 
-      const numSamples = bytes.length / 2;
-      const audioBuf = playbackCtx.createBuffer(1, numSamples, sampleRate);
+      // 解碼所有 chunks
+      const decoded = chunks.map(chunk => {
+        const binary = atob(chunk.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const n = bytes.length >> 1;  // 16-bit = 2 bytes per sample
+        return { bytes, n };
+      });
+
+      const totalSamples = decoded.reduce((sum, d) => sum + d.n, 0);
+      const audioBuf = playbackCtx.createBuffer(1, totalSamples, sampleRate);
       const channelData = audioBuf.getChannelData(0);
-      const view = new DataView(bytes.buffer);
-      for (let i = 0; i < numSamples; i++) {
-        channelData[i] = view.getInt16(i * 2, true) / 32768;
+
+      let offset = 0;
+      for (const { bytes, n } of decoded) {
+        const view = new DataView(bytes.buffer);
+        for (let i = 0; i < n; i++) {
+          channelData[offset + i] = view.getInt16(i * 2, true) / 32768;
+        }
+        offset += n;
       }
 
       const src = playbackCtx.createBufferSource();
       src.buffer = audioBuf;
       src.connect(playbackCtx.destination);
-      const now = playbackCtx.currentTime;
-      src.start(Math.max(now, nextPlayTime));
-      nextPlayTime = Math.max(now, nextPlayTime) + audioBuf.duration;
+      src.onended = () => setStatus('說完了嗎？繼續按住麥克風', '');
+
+      setStatus('AI 說話中…', 'speaking');
+
+      // iOS Safari: resume context if needed, then play
+      const doPlay = () => src.start(playbackCtx.currentTime);
+      if (playbackCtx.state === 'running') {
+        doPlay();
+      } else {
+        playbackCtx.resume().then(doPlay).catch(() => setStatus('音訊播放失敗', ''));
+      }
     }
 
     // ─── 音訊工具函式 ────────────────────────────────────────
@@ -938,7 +975,8 @@
       sessionActive = false;
       currentAiText = '';
       currentAiMsgEl = null;
-      nextPlayTime = 0;
+      pendingAudioChunks = [];
+      window._userMsgEl = null;
       btnEnd.classList.add('hidden');
       btnCards.style.display = 'none';
       closeWS();

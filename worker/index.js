@@ -100,9 +100,10 @@ async function handleWebSocket(request, env, url) {
   const setupMsg = {
     setup: {
       model: GEMINI_LIVE_MODEL,
-      inputAudioTranscription: {},  // 啟用使用者語音轉錄
+      inputAudioTranscription: {},   // 使用者語音轉文字
+      outputAudioTranscription: {},  // AI 語音轉文字（字幕用）
       generationConfig: {
-        responseModalities: ['AUDIO', 'TEXT'],
+        responseModalities: ['AUDIO'],  // 純語音；文字透過 outputTranscription 取得
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: {
