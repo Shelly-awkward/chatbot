@@ -1,21 +1,34 @@
 /**
- * Cloudflare Worker — 語言學習助理後端
+ * Cloudflare Worker — 語言學習助理後端 (WebSocket 版)
  *
  * 環境變數（在 Cloudflare Dashboard 設定，不要寫在程式碼裡）：
  *   GEMINI_API_KEY   — Google AI Studio API Key
  *   NOTION_TOKEN     — Notion Integration Token
  *   NOTION_DB_ID     — Notion 學習卡片資料庫 ID
- *   ALLOWED_ORIGIN   — 前端網址，例如 https://chatbot.pages.dev
+ *   ALLOWED_ORIGIN   — 前端網址，例如 https://chatbot.shellydiligence.workers.dev
  */
+
+// Gemini Live API 模型名稱
+// 穩定版：gemini-2.0-flash-live-001
+// 若有 2.5 Native Audio 存取權，可改為：gemini-2.5-flash-native-audio-preview
+const GEMINI_LIVE_MODEL = 'models/gemini-2.0-flash-live-001';
+
+// 各語言對應 Gemini 語音名稱
+const VOICE_MAP = {
+  ja: 'Kore',
+  en: 'Puck',
+  ko: 'Kore',
+  fr: 'Aoede',
+  de: 'Aoede',
+  es: 'Aoede',
+};
 
 export default {
   async fetch(request, env) {
-    // CORS
     const origin = request.headers.get('Origin') || '';
     const allowedOrigin = env.ALLOWED_ORIGIN || '';
-
-    // 開發期間允許 localhost；正式部署後只允許自己的 domain
-    const isAllowed = origin === allowedOrigin ||
+    const isAllowed =
+      origin === allowedOrigin ||
       origin.startsWith('http://localhost') ||
       origin.startsWith('http://127.0.0.1');
 
@@ -29,10 +42,15 @@ export default {
 
     const url = new URL(request.url);
 
-    try {
-      if (url.pathname === '/chat' && request.method === 'POST') {
-        return await handleChat(request, env, origin);
+    // ── WebSocket 升級 ───────────────────────────────────────────
+    if (url.pathname === '/ws') {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return new Response('Expected WebSocket upgrade', { status: 426 });
       }
+      return handleWebSocket(request, env, url);
+    }
+
+    try {
       if (url.pathname === '/cards' && request.method === 'POST') {
         return await handleCards(request, env, origin);
       }
@@ -47,83 +65,82 @@ export default {
       console.error(err);
       return corsResponse(JSON.stringify({ error: err.message }), 500, origin, isAllowed);
     }
-  }
+  },
 };
 
-// ─── /chat ─────────────────────────────────────────────────────────────────
-// 接收音訊 → Gemini 轉錄 + 回應 → 回傳文字 + 音訊 base64
-async function handleChat(request, env, origin) {
-  const formData = await request.formData();
-  const audioFile = formData.get('audio');
-  const systemPrompt = formData.get('systemPrompt') || '';
-  const history = JSON.parse(formData.get('history') || '[]');
-  const lang = formData.get('lang') || 'ja';
-  const outputMode = formData.get('outputMode') || 'both';
+// ─── WebSocket 代理 ─────────────────────────────────────────────────────────
+// 瀏覽器 ↔ Worker ↔ Gemini Live API
+async function handleWebSocket(request, env, url) {
+  const systemPrompt = url.searchParams.get('system') || '';
+  const lang = url.searchParams.get('lang') || 'ja';
 
-  // Step 1：將音訊轉成 base64
-  const audioBuffer = await audioFile.arrayBuffer();
-  const audioBase64 = arrayBufferToBase64(audioBuffer);
+  // 建立與瀏覽器的 WebSocket 連線對
+  const { 0: client, 1: server } = new WebSocketPair();
+  server.accept();
 
-  // Step 2：呼叫 Gemini（音訊輸入 + 文字回應）
-  // 使用 gemini-2.5-flash 處理語音轉錄 + 對話回應
-  const geminiMessages = [
-    ...history.map(h => ({
-      role: h.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: h.content }]
-    })),
-    {
-      role: 'user',
-      parts: [
-        {
-          inlineData: {
-            mimeType: 'audio/webm',
-            data: audioBase64
-          }
+  // 連線到 Gemini Live API
+  const geminiEndpoint =
+    `https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${env.GEMINI_API_KEY}`;
+
+  let geminiWs;
+  try {
+    const resp = await fetch(geminiEndpoint, {
+      headers: { Upgrade: 'websocket' },
+    });
+    geminiWs = resp.webSocket;
+    if (!geminiWs) throw new Error('Gemini 未回傳 WebSocket');
+    geminiWs.accept();
+  } catch (err) {
+    console.error('Gemini WS connect failed:', err);
+    server.close(1011, 'Failed to connect to Gemini: ' + err.message);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // 送出 Gemini setup 訊息
+  const setupMsg = {
+    setup: {
+      model: GEMINI_LIVE_MODEL,
+      inputAudioTranscription: {},  // 啟用使用者語音轉錄
+      generationConfig: {
+        responseModalities: ['AUDIO', 'TEXT'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: VOICE_MAP[lang] || 'Puck',
+            },
+          },
         },
-        { text: '請先轉錄我說的話，然後根據你的角色設定回應。回應格式：\n[轉錄]使用者說的原文\n[回應]你的回應內容' }
-      ]
-    }
-  ];
+      },
+      ...(systemPrompt
+        ? { systemInstruction: { parts: [{ text: systemPrompt }] } }
+        : {}),
+    },
+  };
+  geminiWs.send(JSON.stringify(setupMsg));
 
-  const geminiRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: geminiMessages,
-        generationConfig: { temperature: 0.8, maxOutputTokens: 1000 }
-      })
-    }
-  );
+  // Gemini → 瀏覽器（全部轉發）
+  geminiWs.addEventListener('message', ({ data }) => {
+    try { server.send(data); } catch {}
+  });
+  geminiWs.addEventListener('close', ({ code, reason }) => {
+    try { server.close(code, reason); } catch {}
+  });
+  geminiWs.addEventListener('error', () => {
+    try { server.close(1011, 'Gemini connection error'); } catch {}
+  });
 
-  if (!geminiRes.ok) {
-    const errText = await geminiRes.text();
-    throw new Error(`Gemini API 失敗：${geminiRes.status} ${errText}`);
-  }
+  // 瀏覽器 → Gemini（全部轉發）
+  server.addEventListener('message', ({ data }) => {
+    try { geminiWs.send(data); } catch {}
+  });
+  server.addEventListener('close', () => {
+    try { geminiWs.close(); } catch {}
+  });
 
-  const geminiData = await geminiRes.json();
-  const fullText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-  // 解析轉錄和回應
-  const transcriptMatch = fullText.match(/\[轉錄\]([\s\S]*?)(?=\[回應\]|$)/);
-  const responseMatch = fullText.match(/\[回應\]([\s\S]*?)$/);
-  const userText = transcriptMatch ? transcriptMatch[1].trim() : '';
-  const aiText = responseMatch ? responseMatch[1].trim() : fullText.trim();
-
-  // Step 3：如果需要語音輸出，呼叫 Gemini TTS
-  let audioBase64Out = null;
-  if (outputMode === 'audio' || outputMode === 'both') {
-    audioBase64Out = await generateTTS(aiText, lang, env);
-  }
-
-  const result = { userText, aiText, audioBase64: audioBase64Out };
-  return corsResponse(JSON.stringify(result), 200, origin, true);
+  return new Response(null, { status: 101, webSocket: client });
 }
 
-// ─── /cards ────────────────────────────────────────────────────────────────
-// 分析對話 → 生成學習卡片 JSON
+// ─── /cards ─────────────────────────────────────────────────────────────────
 async function handleCards(request, env, origin) {
   const { history, lang } = await request.json();
 
@@ -156,23 +173,20 @@ ${conversationText}
 
 如果沒有值得記錄的內容，回傳 {"cards": []}`;
 
-  // 優先用 Gemma 4 省 Gemini 配額
   const gemmaRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-it:generateContent?key=${env.GEMINI_API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=${env.GEMINI_API_KEY}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.3, maxOutputTokens: 2000 }
-      })
+        generationConfig: { temperature: 0.3, maxOutputTokens: 2000 },
+      }),
     }
   );
 
   const gemmaData = await gemmaRes.json();
   let rawText = gemmaData.candidates?.[0]?.content?.parts?.[0]?.text || '{"cards":[]}';
-
-  // 清理 JSON
   rawText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
   let cards;
@@ -185,8 +199,7 @@ ${conversationText}
   return corsResponse(JSON.stringify({ cards }), 200, origin, true);
 }
 
-// ─── /notion ───────────────────────────────────────────────────────────────
-// 將學習卡片寫進 Notion 資料庫
+// ─── /notion ────────────────────────────────────────────────────────────────
 async function handleNotion(request, env, origin) {
   const { cards, lang } = await request.json();
 
@@ -210,69 +223,32 @@ async function handleNotion(request, env, origin) {
         '例句': { rich_text: [{ text: { content: examplesText } }] },
         '學習日期': { date: { start: today } },
         '熟悉度': { select: { name: '新學' } },
-      }
+      },
     };
 
     const notionRes = await fetch('https://api.notion.com/v1/pages', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${env.NOTION_TOKEN}`,
+        Authorization: `Bearer ${env.NOTION_TOKEN}`,
         'Content-Type': 'application/json',
         'Notion-Version': '2022-06-28',
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
     });
 
     results.push(notionRes.ok);
   }
 
   const success = results.every(Boolean);
-  return corsResponse(JSON.stringify({ success, count: results.filter(Boolean).length }), 200, origin, true);
-}
-
-// ─── TTS ────────────────────────────────────────────────────────────────────
-async function generateTTS(text, lang, env) {
-  const voiceMap = {
-    ja: 'ja-JP-Neural2-B',
-    en: 'en-US-Neural2-D',
-    ko: 'ko-KR-Neural2-A',
-    fr: 'fr-FR-Neural2-B',
-    de: 'de-DE-Neural2-B',
-    es: 'es-ES-Neural2-B',
-  };
-
-  // 使用 Gemini 2.5 Flash TTS
-  const ttsRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text }] }],
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
-        }
-      })
-    }
+  return corsResponse(
+    JSON.stringify({ success, count: results.filter(Boolean).length }),
+    200,
+    origin,
+    true
   );
-
-  if (!ttsRes.ok) return null;
-
-  const ttsData = await ttsRes.json();
-  return ttsData.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
 }
 
-// ─── 工具函式 ───────────────────────────────────────────────────────────────
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
+// ─── 工具函式 ────────────────────────────────────────────────────────────────
 function corsResponse(body, status, origin, isAllowed) {
   const headers = {
     'Content-Type': 'application/json',

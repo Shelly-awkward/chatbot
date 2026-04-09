@@ -509,7 +509,6 @@
 
   <script>
     // ─── 設定 ───────────────────────────────────────────────
-    // Worker URL：部署後替換
     const WORKER_URL = 'https://chatbotp-orker.shellydiligence.workers.dev';
 
     const LANG_NAMES = {
@@ -541,12 +540,23 @@
     let currentSubmode = 'free';
     let currentLang = 'ja';
     let currentScenario = null;
-    let outputMode = 'both'; // both / audio / text
-    let isRecording = false;
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let conversationHistory = [];
+    let outputMode = 'both';
     let sessionActive = false;
+    let conversationHistory = [];
+
+    // WebSocket 狀態
+    let ws = null;
+    let setupComplete = false;
+    let isStreaming = false;
+
+    // 音訊狀態
+    let audioCtx = null;       // 錄音用（16kHz）
+    let playbackCtx = null;    // 播放用
+    let micStream = null;
+    let scriptProcessor = null;
+    let nextPlayTime = 0;
+    let currentAiText = '';
+    let currentAiMsgEl = null;
 
     // ─── DOM ────────────────────────────────────────────────
     const btnMic = document.getElementById('btnMic');
@@ -578,6 +588,7 @@
           scenarioView.classList.add('hidden');
           conversationView.style.display = 'flex';
         }
+        closeWS(); // system prompt 改變，下次重新連線
         setStatus('準備好了，按住麥克風開始');
       });
     });
@@ -595,6 +606,7 @@
           scenarioView.classList.add('hidden');
           conversationView.style.display = 'flex';
         }
+        closeWS();
       });
     });
 
@@ -607,6 +619,7 @@
         addMessage('system', `情境：${card.querySelector('.s-name').textContent}　語言：${LANG_NAMES[currentLang]}`);
         sessionActive = true;
         btnEnd.classList.remove('hidden');
+        closeWS(); // 新情境需要新的 system prompt
       });
     });
 
@@ -622,115 +635,10 @@
     // ─── 語言切換 ───────────────────────────────────────────
     document.getElementById('langSelect').addEventListener('change', e => {
       currentLang = e.target.value;
+      closeWS(); // 語言改變，語音設定不同，需要重連
     });
 
-    // ─── 麥克風 ─────────────────────────────────────────────
-    btnMic.addEventListener('mousedown', startRecording);
-    btnMic.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); }, { passive: false });
-    btnMic.addEventListener('mouseup', stopRecording);
-    btnMic.addEventListener('mouseleave', stopRecording);
-    btnMic.addEventListener('touchend', stopRecording);
-
-    async function startRecording() {
-      if (isRecording) return;
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        audioChunks = [];
-        mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-        mediaRecorder.start();
-        isRecording = true;
-        btnMic.classList.add('recording');
-        btnMic.textContent = '⏹️';
-        setStatus('錄音中…', 'listening');
-      } catch (err) {
-        setStatus('無法存取麥克風，請確認權限', '');
-      }
-    }
-
-    async function stopRecording() {
-  if (!isRecording || !mediaRecorder) return;
-  isRecording = false;
-  btnMic.classList.remove('recording');
-  btnMic.textContent = '🎙️';
-
-  mediaRecorder.stop();
-  mediaRecorder.stream.getTracks().forEach(t => t.stop());
-
-  mediaRecorder.onstop = async () => {
-    const mimeType = audioChunks[0]?.type || 'audio/mp4';
-    const audioBlob = new Blob(audioChunks, { type: mimeType });
-    if (audioBlob.size < 1000) { setStatus('太短了，請再說一次'); return; }
-    await sendToWorker(audioBlob, mimeType);
-  };
-}
-
-    // ─── 送出至 Worker ──────────────────────────────────────
-    async function sendToWorker(audioBlob, mimeType = 'audio/mp4') {
-      setStatus('AI 思考中…', 'processing');
-      btnMic.classList.add('disabled');
-
-      try {
-        const systemPrompt = getSystemPrompt();
-        const formData = new FormData();
-        const ext = mimeType.includes('mp4') ? 'm4a' : 'webm'; formData.append('audio', audioBlob, `recording.${ext}`); formData.append('mimeType', mimeType);;
-        formData.append('systemPrompt', systemPrompt);
-        formData.append('history', JSON.stringify(conversationHistory));
-        formData.append('lang', currentLang);
-        formData.append('mode', currentMode);
-        formData.append('outputMode', outputMode);
-
-        const res = await fetch(`${WORKER_URL}/chat`, {
-          method: 'POST',
-          body: formData,
-        });
-
-        if (!res.ok) {   const errBody = await res.text();   throw new Error(`Worker 回傳 ${res.status}: ${errBody}`); }
-
-        const data = await res.json();
-
-        // 顯示使用者說的話（由 Worker 轉錄）
-        if (data.userText) {
-          addMessage('user', data.userText);
-          conversationHistory.push({ role: 'user', content: data.userText });
-        }
-
-        // 顯示 AI 回應文字
-        if (data.aiText && (outputMode === 'text' || outputMode === 'both')) {
-          const aiText = data.aiText;
-          const correctionMatch = aiText.match(/\[糾錯\]\s*(.*)/s);
-          const mainText = aiText.replace(/\[糾錯\][\s\S]*$/, '').trim();
-          addMessage('ai', mainText, correctionMatch ? correctionMatch[1].trim() : null);
-        }
-
-        // 播放 AI 語音
-        if (data.audioBase64 && (outputMode === 'audio' || outputMode === 'both')) {
-          await playAudio(data.audioBase64);
-        }
-
-        if (data.aiText) {
-          conversationHistory.push({ role: 'assistant', content: data.aiText });
-        }
-
-        sessionActive = true;
-        btnEnd.classList.remove('hidden');
-        if (conversationHistory.length >= 4) btnCards.style.display = 'flex';
-        setStatus('說完了嗎？繼續按住麥克風', '');
-
-      } catch (err) {
-  setStatus('連線失敗：' + err.message, '');
-  alert(JSON.stringify({
-    message: err.message,
-    name: err.name,
-    workerUrl: WORKER_URL
-  }));
-  console.error(err);
-}
-      } finally {
-        btnMic.classList.remove('disabled');
-      }
-    }
-
+    // ─── WebSocket ──────────────────────────────────────────
     function getSystemPrompt() {
       if (currentMode === 'translate') return SYSTEM_PROMPTS.translate(currentLang);
       const sub = currentSubmode;
@@ -738,15 +646,262 @@
       return SYSTEM_PROMPTS.learn[sub](currentLang);
     }
 
-    // ─── 播放音訊 ───────────────────────────────────────────
-    async function playAudio(base64) {
-      setStatus('AI 說話中…', 'speaking');
-      return new Promise(resolve => {
-        const audio = new Audio('data:audio/mp3;base64,' + base64);
-        audio.onended = () => { setStatus('說完了嗎？繼續按住麥克風', ''); resolve(); };
-        audio.onerror = resolve;
-        audio.play().catch(resolve);
+    function closeWS() {
+      if (ws) {
+        ws.onmessage = null;
+        ws.onclose = null;
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      setupComplete = false;
+    }
+
+    function connectWS(systemPrompt) {
+      return new Promise((resolve, reject) => {
+        closeWS();
+        const wsBase = WORKER_URL.replace('https://', 'wss://');
+        const url = `${wsBase}/ws?system=${encodeURIComponent(systemPrompt)}&lang=${currentLang}`;
+        ws = new WebSocket(url);
+
+        const timeout = setTimeout(() => reject(new Error('連線逾時')), 12000);
+
+        ws.onmessage = (event) => {
+          let msg;
+          try { msg = JSON.parse(event.data); } catch { return; }
+          if (msg.setupComplete !== undefined) {
+            clearTimeout(timeout);
+            setupComplete = true;
+            ws.onmessage = handleGeminiMessage;
+            resolve();
+          }
+        };
+
+        ws.onerror = () => {
+          clearTimeout(timeout);
+          reject(new Error('WebSocket 連線失敗'));
+        };
+
+        ws.onclose = () => {
+          clearTimeout(timeout);
+          setupComplete = false;
+          if (!isStreaming) setStatus('連線中斷，請重新按麥克風', '');
+        };
       });
+    }
+
+    function handleGeminiMessage(event) {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      // Gemini 打斷（使用者說話時打斷 AI）
+      if (msg.serverContent?.interrupted) {
+        nextPlayTime = 0;
+        return;
+      }
+
+      // 使用者語音轉錄（需在 setup 啟用 inputAudioTranscription）
+      if (msg.serverContent?.inputTranscription?.finished && msg.serverContent.inputTranscription.text) {
+        const userText = msg.serverContent.inputTranscription.text.trim();
+        if (userText) {
+          addMessage('user', userText);
+          conversationHistory.push({ role: 'user', content: userText });
+        }
+      }
+
+      // AI 回應（音訊 + 文字串流）
+      if (msg.serverContent?.modelTurn?.parts) {
+        for (const part of msg.serverContent.modelTurn.parts) {
+          // 音訊串流
+          if (part.inlineData?.mimeType?.startsWith('audio/') && outputMode !== 'text') {
+            const rateMatch = part.inlineData.mimeType.match(/rate=(\d+)/);
+            const sampleRate = rateMatch ? parseInt(rateMatch[1]) : 24000;
+            playPCM16(part.inlineData.data, sampleRate);
+          }
+          // 文字串流（逐字累積）
+          if (part.text) {
+            currentAiText += part.text;
+            if (outputMode !== 'audio') {
+              if (!currentAiMsgEl) {
+                emptyState.classList.add('hidden');
+                currentAiMsgEl = document.createElement('div');
+                currentAiMsgEl.className = 'msg ai';
+                conversation.appendChild(currentAiMsgEl);
+              }
+              currentAiMsgEl.textContent = currentAiText;
+              conversation.scrollTop = conversation.scrollHeight;
+            }
+          }
+        }
+      }
+
+      // AI 回應結束（本輪完成）
+      if (msg.serverContent?.turnComplete) {
+        // 解析糾錯標注
+        if (currentAiMsgEl && currentAiText) {
+          const correctionMatch = currentAiText.match(/\[糾錯\]\s*([\s\S]*)/);
+          if (correctionMatch) {
+            const mainText = currentAiText.replace(/\[糾錯\][\s\S]*$/, '').trim();
+            currentAiMsgEl.textContent = mainText;
+            const lines = correctionMatch[1].trim().split('\n').filter(Boolean);
+            const corrDiv = document.createElement('div');
+            corrDiv.className = 'correction';
+            corrDiv.innerHTML = lines.map((l, i) =>
+              i === 0 ? `❌ ${l}` : `<div class="correct">✅ ${l}</div>`
+            ).join('');
+            currentAiMsgEl.appendChild(corrDiv);
+          }
+          currentAiMsgEl = null;
+        }
+        if (currentAiText) {
+          conversationHistory.push({ role: 'assistant', content: currentAiText });
+          currentAiText = '';
+        }
+        setStatus('說完了嗎？繼續按住麥克風', '');
+        sessionActive = true;
+        btnEnd.classList.remove('hidden');
+        if (conversationHistory.length >= 4) btnCards.style.display = 'flex';
+      }
+    }
+
+    // ─── 麥克風（按住說話）──────────────────────────────────
+    btnMic.addEventListener('mousedown', startStreaming);
+    btnMic.addEventListener('touchstart', e => { e.preventDefault(); startStreaming(); }, { passive: false });
+    btnMic.addEventListener('mouseup', stopStreaming);
+    btnMic.addEventListener('mouseleave', stopStreaming);
+    btnMic.addEventListener('touchend', stopStreaming);
+
+    async function startStreaming() {
+      if (isStreaming) return;
+
+      // 第一次按鈕時初始化 AudioContext（iOS 要求在 user gesture 內）
+      if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 16000 });
+      if (!playbackCtx) playbackCtx = new AudioContext();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      if (playbackCtx.state === 'suspended') await playbackCtx.resume();
+
+      // 取得麥克風
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+      } catch {
+        setStatus('無法存取麥克風，請確認權限', '');
+        return;
+      }
+
+      // 連線（若尚未連線或已斷線）
+      if (!ws || ws.readyState !== WebSocket.OPEN || !setupComplete) {
+        setStatus('連線中…', 'processing');
+        try {
+          await connectWS(getSystemPrompt());
+        } catch (err) {
+          setStatus('連線失敗：' + err.message, '');
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+      }
+
+      // 打斷 AI 正在說話時，重置播放佇列
+      nextPlayTime = 0;
+      currentAiText = '';
+      currentAiMsgEl = null;
+
+      micStream = stream;
+      isStreaming = true;
+      btnMic.classList.add('recording');
+      btnMic.textContent = '⏹️';
+      setStatus('錄音中…', 'listening');
+
+      // Web Audio API → PCM 16kHz → WebSocket
+      const source = audioCtx.createMediaStreamSource(stream);
+      scriptProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      scriptProcessor.onaudioprocess = (e) => {
+        if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+        let samples = e.inputBuffer.getChannelData(0);
+        // 若 AudioContext 實際 rate 不是 16000（部分 iOS），降採樣
+        if (audioCtx.sampleRate !== 16000) {
+          samples = resampleTo16k(new Float32Array(samples), audioCtx.sampleRate);
+        }
+        const pcm = float32ToPCM16(samples);
+        ws.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm.buffer) }]
+          }
+        }));
+      };
+
+      source.connect(scriptProcessor);
+      scriptProcessor.connect(audioCtx.destination);
+    }
+
+    function stopStreaming() {
+      if (!isStreaming) return;
+      isStreaming = false;
+
+      btnMic.classList.remove('recording');
+      btnMic.textContent = '🎙️';
+      setStatus('AI 思考中…', 'processing');
+
+      // 停止麥克風
+      if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+
+      // 告知 Gemini 本輪結束，請回應
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ clientContent: { turnComplete: true } }));
+      }
+    }
+
+    // ─── PCM 播放（Gemini 回傳 PCM 24kHz）──────────────────
+    function playPCM16(base64, sampleRate = 24000) {
+      if (!playbackCtx) return;
+      setStatus('AI 說話中…', 'speaking');
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      const numSamples = bytes.length / 2;
+      const audioBuf = playbackCtx.createBuffer(1, numSamples, sampleRate);
+      const channelData = audioBuf.getChannelData(0);
+      const view = new DataView(bytes.buffer);
+      for (let i = 0; i < numSamples; i++) {
+        channelData[i] = view.getInt16(i * 2, true) / 32768;
+      }
+
+      const src = playbackCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(playbackCtx.destination);
+      const now = playbackCtx.currentTime;
+      src.start(Math.max(now, nextPlayTime));
+      nextPlayTime = Math.max(now, nextPlayTime) + audioBuf.duration;
+    }
+
+    // ─── 音訊工具函式 ────────────────────────────────────────
+    function resampleTo16k(samples, fromRate) {
+      const ratio = fromRate / 16000;
+      const len = Math.round(samples.length / ratio);
+      const out = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        out[i] = samples[Math.min(Math.round(i * ratio), samples.length - 1)];
+      }
+      return out;
+    }
+
+    function float32ToPCM16(samples) {
+      const buf = new Int16Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return buf;
+    }
+
+    function arrayBufferToBase64(buf) {
+      let binary = '';
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
     }
 
     // ─── 訊息顯示 ───────────────────────────────────────────
@@ -781,8 +936,12 @@
       emptyState.classList.remove('hidden');
       conversationHistory = [];
       sessionActive = false;
+      currentAiText = '';
+      currentAiMsgEl = null;
+      nextPlayTime = 0;
       btnEnd.classList.add('hidden');
       btnCards.style.display = 'none';
+      closeWS();
       setStatus('準備好了，按住麥克風開始');
     });
 
@@ -830,10 +989,7 @@
         cardList.appendChild(div);
       });
       cardOverlay.classList.add('show');
-
-      // 下載 md
       document.getElementById('btnDownloadMd').onclick = () => downloadMd(cards);
-      // 推送 Notion
       document.getElementById('btnSaveNotion').onclick = () => pushToNotion(cards);
     }
 
